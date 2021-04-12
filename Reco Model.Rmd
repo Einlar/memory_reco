@@ -1,0 +1,513 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.10.2
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{python}
+import numpy as np
+
+import matplotlib.pyplot as plt
+```
+
+```{python}
+from p_tqdm import p_umap
+```
+
+```{python}
+from numba import jit
+```
+
+```{python}
+from numba import njit
+```
+
+```{python}
+@njit
+def simulate_sparse_dynamics_numba(index, L = 100, N = 1000, f = 0.01):
+    
+    #Compute similarity matrix
+    mtx = np.zeros((L, N))
+    mask = np.random.uniform(0., 1., size=(L, N)) < f
+    
+    for row_idx in range(mtx.shape[0]): #fill ones
+        mtx[row_idx][mask[row_idx]] = 1
+
+    sim = mtx @ mtx.T
+    np.fill_diagonal(sim, 0)
+
+    #assert np.all(np.any(sim[0].reshape(-1,1) == sim, axis=1)), "A row must not be filled with all equal values"
+    #There should be at least two different values in each row, or else the algorithm fails
+    
+    next_index = np.zeros(L, dtype=np.uint64)
+    second_next_index = np.zeros(L, dtype=np.uint64)
+    
+    for row_idx in range(mtx.shape[0]): #Extract highest and second highest index from each row
+        max_val = np.max(sim[row_idx])
+        max_idx = np.flatnonzero(sim[row_idx] == max_val) 
+        
+        next_index[row_idx] = np.random.choice(max_idx)
+        
+        sim[row_idx][max_idx] = -1 #Remove max value. The new maximum is now the second highest value
+        max_val = np.max(sim[row_idx])
+        max_idx = np.flatnonzero(sim[row_idx] == max_val)
+        
+        second_next_index[row_idx] = np.random.choice(max_idx)
+        
+    #---Simulate dynamics---#
+    prec_state = np.zeros(L, dtype=np.uint64) #Initialize
+    curr_state = np.arange(L, dtype=np.uint64)
+
+    visited = np.eye(L, dtype=np.uint64) #Each row is a binary vector storing the visited elements of each trial
+
+    prec_tot_visited = 0 
+    curr_tot_visited = L #Total number of visited elements (sum over all trials) 
+    
+    max_patience = 10 #If no new element is visited in any trial for this many iterations, then exit the loop and declare convergence
+    curr_patience = max_patience #Counter that decreases whenever no trial visits a new item during a whole iteration. If it reaches 0, the loop is terminated.
+    
+    n_iter = 0 #Counter for iterations
+
+    while True:
+        n_iter += 1
+
+        #Update
+        next_state = next_index[curr_state] 
+        mask = (next_state == prec_state) #If a direct backward step has happened
+        next_state[mask] = second_next_index[curr_state][mask] #Correct it
+
+        prec_state, curr_state = curr_state, next_state #Advance
+        
+        for i in range(L):
+            visited[i][curr_state[i]] = 1
+        
+        curr_tot_visited = visited.sum()
+        
+        if curr_tot_visited > prec_tot_visited: #If some trial has visited a new element
+            curr_patience    = max_patience
+            prec_tot_visited = curr_tot_visited
+        else:
+            curr_patience -= 1
+
+        if curr_patience <= 0: #Exit condition
+            break
+
+    lengths = np.sum(visited, axis=1) 
+
+    return np.mean(lengths)
+```
+
+```{python}
+simulate_sparse_dynamics_numba(1, L=8, N=10000, f=0.1)
+```
+
+```{python}
+stats = []
+
+L = 100
+N = 100000
+f = 0.01
+
+def simulate_sparse_dynamics(index, L = 100, N = 1000, f = 0.01):
+    import numpy as np
+    import scipy.sparse
+    
+    #Compute similarity matrix
+    mtx = np.zeros((L, N))
+    mask = np.random.uniform(size=(L, N)) < f
+    mtx[mask] = 1 
+
+    sim = mtx @ mtx.T
+    np.fill_diagonal(sim, 0)
+
+    #assert np.all(np.any(sim[0].reshape(-1,1) == sim, axis=1)), "A row must not be filled with all equal values"
+    #There should be at least two different values in each row, or else the algorithm fails
+
+    max_pos = (sim == np.max(sim, axis=0).reshape(-1,1))
+    maxima = np.argwhere(max_pos)
+    maxima_dict = {}
+    for (key, value) in maxima:
+        maxima_dict.setdefault(key, []).append(value)
+
+    sim[max_pos] = -1
+
+    second_max_pos = (sim == np.max(sim, axis=1).reshape(-1,1))
+    second_maxima = np.argwhere(second_max_pos)
+    second_maxima_dict = {}
+    for (key, value) in second_maxima:
+        second_maxima_dict.setdefault(key, []).append(value)
+
+    #The intersection between values of these two dictionaries should be empty
+#     for key, value in maxima_dict.items():
+#         assert len(set(value).intersection(set(second_maxima_dict[key]))) == 0
+
+    next_index = np.zeros(L, dtype=int)
+
+    for key, value in maxima_dict.items():
+        next_index[key] = np.random.choice(value)
+
+    second_next_index = np.zeros(L, dtype=int)
+
+    for key, value in second_maxima_dict.items():
+        second_next_index[key] = np.random.choice(value)
+
+    prec_state = np.full(L, -1, dtype=int)
+    state = np.arange(L, dtype=int) #Initialize
+
+    visited = [set([i]) for i in range(L)]
+
+    prec_lens = -1
+    lens = 0
+    max_patience = 10
+    patience = max_patience
+    n_iter = 0
+
+    while True:
+        n_iter += 1
+
+        #Update
+        next_state = next_index[state] 
+        mask = (next_state == prec_state) #If a direct backward step has happened
+        next_state[mask] = second_next_index[state][mask] #Correct it
+
+        prec_state, state = state, next_state #Advance
+
+        lens = 0
+        for i in range(L):
+            visited[i].add(state[i])
+            lens += len(visited[i])
+
+        if lens > prec_lens:
+            patience = max_patience
+            prec_lens = lens
+        else:
+            patience -= 1
+
+        if patience <= 0:
+            break
+
+    #print(f"Converged in {n_iter} iterations")
+
+    lengths = [len(vis) for vis in visited]
+
+    return np.mean(lengths)
+```
+
+```{python}
+# %timeit simulate_sparse_dynamics(1, 100, 100000, 0.01)
+```
+
+```{python}
+import scipy.sparse
+
+stats = []
+
+L = 100
+N = 100000
+f = 0.01
+
+def simulate_sparse_dynamics_v2(index, L = 100, N = 1000, f = 0.01):
+    import numpy as np
+    import scipy.sparse
+    
+    #Compute similarity matrix
+    n_nonzero_entries = np.random.binomial(L * N, f)
+    
+    indices = np.random.randint(1, L * N, size=n_nonzero_entries)
+    j = np.floor(indices * 1. / L).astype(int)
+    i = (indices - j * L).astype(int)
+    sparse_mtx = scipy.sparse.coo_matrix((np.ones(n_nonzero_entries), (i, j)), shape=(L, N))
+    
+    sim = (sparse_mtx @ sparse_mtx.T).todense()
+    np.fill_diagonal(sim, 0)
+
+    #assert np.all(np.any(sim[0].reshape(-1,1) == sim, axis=1)), "A row must not be filled with all equal values"
+    #There should be at least two different values in each row, or else the algorithm fails
+
+    max_pos = (sim == np.max(sim, axis=0).reshape(-1,1))
+    maxima = np.argwhere(max_pos)
+    maxima_dict = {}
+    for (key, value) in maxima:
+        maxima_dict.setdefault(key, []).append(value)
+
+    sim[max_pos] = -1
+
+    second_max_pos = (sim == np.max(sim, axis=1).reshape(-1,1))
+    second_maxima = np.argwhere(second_max_pos)
+    second_maxima_dict = {}
+    for (key, value) in second_maxima:
+        second_maxima_dict.setdefault(key, []).append(value)
+
+    #The intersection between values of these two dictionaries should be empty
+#     for key, value in maxima_dict.items():
+#         assert len(set(value).intersection(set(second_maxima_dict[key]))) == 0
+
+    next_index = np.zeros(L, dtype=int)
+
+    for key, value in maxima_dict.items():
+        next_index[key] = np.random.choice(value)
+
+    second_next_index = np.zeros(L, dtype=int)
+
+    for key, value in second_maxima_dict.items():
+        second_next_index[key] = np.random.choice(value)
+
+    prec_state = np.full(L, -1, dtype=int)
+    state = np.arange(L, dtype=int) #Initialize
+
+    visited = [set([i]) for i in range(L)]
+
+    prec_lens = -1
+    lens = 0
+    max_patience = 10
+    patience = max_patience
+    n_iter = 0
+
+    while True:
+        n_iter += 1
+
+        #Update
+        next_state = next_index[state] 
+        mask = (next_state == prec_state) #If a direct backward step has happened
+        next_state[mask] = second_next_index[state][mask] #Correct it
+
+        prec_state, state = state, next_state #Advance
+
+        lens = 0
+        for i in range(L):
+            visited[i].add(state[i])
+            lens += len(visited[i])
+
+        if lens > prec_lens:
+            patience = max_patience
+            prec_lens = lens
+        else:
+            patience -= 1
+
+        if patience <= 0:
+            break
+
+    #print(f"Converged in {n_iter} iterations")
+
+    lengths = [len(vis) for vis in visited]
+
+    return np.mean(lengths)
+```
+
+```{python}
+# %timeit simulate_sparse_dynamics_v2(1, 100, 100000, 0.01)
+```
+
+```{python}
+import scipy.sparse
+
+stats = []
+
+L = 100
+N = 100000
+f = 0.01
+
+def simulate_sparse_dynamics_v3(index, L = 100, N = 1000, f = 0.01):
+    import numpy as np
+    import scipy.sparse
+    
+    #Compute similarity matrix
+    n_nonzero_entries = np.random.binomial(L * N, f)
+    
+    indices = np.random.randint(1, L * N, size=n_nonzero_entries)
+    j = np.floor(indices * 1. / L).astype(int)
+    i = (indices - j * L).astype(int)
+    sparse_mtx = scipy.sparse.coo_matrix((np.ones(n_nonzero_entries), (i, j)), shape=(L, N))
+    
+    sim = (sparse_mtx @ sparse_mtx.T).todense()
+    np.fill_diagonal(sim, 0)
+
+    #assert np.all(np.any(sim[0].reshape(-1,1) == sim, axis=1)), "A row must not be filled with all equal values"
+    #There should be at least two different values in each row, or else the algorithm fails
+
+    max_pos = (sim == np.max(sim, axis=0).reshape(-1,1))
+    maxima = np.argwhere(max_pos)
+    maxima_dict = {}
+    for (key, value) in maxima:
+        maxima_dict.setdefault(key, []).append(value)
+
+    sim[max_pos] = -1
+
+    second_max_pos = (sim == np.max(sim, axis=1).reshape(-1,1))
+    second_maxima = np.argwhere(second_max_pos)
+    second_maxima_dict = {}
+    for (key, value) in second_maxima:
+        second_maxima_dict.setdefault(key, []).append(value)
+
+    #The intersection between values of these two dictionaries should be empty
+#     for key, value in maxima_dict.items():
+#         assert len(set(value).intersection(set(second_maxima_dict[key]))) == 0
+
+    next_index = np.zeros(L, dtype=int)
+
+    for key, value in maxima_dict.items():
+        next_index[key] = np.random.choice(value)
+
+    second_next_index = np.zeros(L, dtype=int)
+
+    for key, value in second_maxima_dict.items():
+        second_next_index[key] = np.random.choice(value)
+
+    prec_state = np.full(L, -1, dtype=int)
+    state = np.arange(L, dtype=int) #Initialize
+
+    visited = np.eye(L, dtype=int)
+
+    prec_lens = -1
+    lens = 0
+    max_patience = 10
+    patience = max_patience
+    n_iter = 0
+
+    while True:
+        n_iter += 1
+
+        #Update
+        next_state = next_index[state] 
+        mask = (next_state == prec_state) #If a direct backward step has happened
+        next_state[mask] = second_next_index[state][mask] #Correct it
+
+        prec_state, state = state, next_state #Advance
+
+        visited[np.arange(L), state] = 1
+        lens = visited.sum()
+        
+#         lens = 0
+#         for i in range(L):
+#             visited[i].add(state[i])
+#             lens += len(visited[i])
+
+        if lens > prec_lens:
+            patience = max_patience
+            prec_lens = lens
+        else:
+            patience -= 1
+
+        if patience <= 0:
+            break
+
+    #print(f"Converged in {n_iter} iterations")
+
+    lengths = np.sum(visited, axis=1)
+
+    return np.mean(lengths)
+```
+
+```{python}
+# %timeit simulate_sparse_dynamics_v3(1, 100, 100000, 0.01)
+```
+
+```{python}
+#Profiling
+# #%load_ext line_profiler
+# #%lprun -f simulate_sparse_dynamics_v3 simulate_sparse_dynamics_v3(1, L=100, N=100000, f=0.01)
+```
+
+```{python}
+from functools import partial
+```
+
+```{python}
+stats = p_umap(partial(simulate_sparse_dynamics_v3, L=100, N=100000, f=0.001), np.arange(10000))
+```
+
+```{python}
+from mpl2latex import mpl2latex, latex_figsize
+```
+
+```{python}
+simulate_sparse_dynamics_numba(1, L=8, N=10000, f=0.1)
+```
+
+```{python}
+#Compute statistics 
+from tqdm.notebook import tqdm
+
+list_lengths = [8, 16, 32, 64, 128, 256, 512]
+frequencies = [0.01]
+
+N = 100000 #Number of neurons
+n_rep = 10000
+
+stats = {}
+
+for f in tqdm(frequencies):
+    results = []
+    print(f'---f = {f}---')
+    for l in tqdm(list_lengths):
+        print(f'l = {l}')
+        r = p_umap(partial(simulate_sparse_dynamics_numba, L=l, N=N, f=f), np.arange(n_rep))
+        results.append(r)
+        
+    stats[f] = results
+```
+
+```{python}
+f01 = [np.mean(a) for a in stats[0.01]]
+```
+
+```{python}
+xs = np.linspace(0, 550, 1000)
+
+
+fig, ax = plt.subplots(figsize=latex_figsize(wf=.8))
+
+ax.plot(xs, np.sqrt(1.5 * np.pi * xs), '-', c='black', label=r"$\sqrt{1.5\pi L}$")
+ax.plot(list_lengths, f01, '-o', c='orange', markersize=4, label='$f=0.01$')
+
+ax.set_xlabel("List length $L$")
+ax.set_ylabel("Recalled items $R$")
+
+plt.legend()
+
+plt.show()
+```
+
+```{python}
+#Optimize with numba
+#Do with symmetric matrix too
+#Finish the plot
+
+#Simulate dynamics with Hopfield network
+```
+
+```{python}
+ax.
+```
+
+```{python}
+np.mean(stats)
+```
+
+```{python}
+np.std(stats)
+```
+
+```{python}
+maxima_dict
+```
+
+```{python}
+# %timeit simulate_sparse_dynamics(1, 100, 100000, 0.1)
+```
+
+```{python}
+# %timeit simulate_sparse_dynamics_v3(1, 100, 100000, 0.1)
+```
+
+```{python}
+
+```
